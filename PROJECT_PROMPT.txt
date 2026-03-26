@@ -1,0 +1,530 @@
+Tu dois implémenter un projet complet de NILM (Non-Intrusive Load Monitoring —
+Surveillance Non-Intrusive de la Charge Électrique) en Python. L'objectif est de
+désagréger la consommation électrique totale d'un foyer (mesurée sur un seul
+compteur global) afin d'identifier et d'estimer la consommation individuelle de
+chaque appareil électrique (réfrigérateur, lave-vaisselle, machine à laver, etc.)
+sans capteur individuel sur chaque appareil.
+
+La méthode principale est le Super-State Hidden Markov Model (SSHMM), combiné à
+l'algorithme de Viterbi pour l'inférence. Le pipeline complet comprend cinq étapes :
+pré-traitement, détection d'événements, clustering, désagrégation par SSHMM+Viterbi,
+et évaluation.
+
+
+================================================================================
+SECTION 1 — CONTEXTE ET DONNÉES
+================================================================================
+
+Jeux de données utilisés (dans Processed_Data_CSV) :
+
+- REFIT (Real world Energy Flexible Intelligent metering dataset) :
+  https://pureportal.strath.ac.uk/en/datasets/refit-electrical-load-measurements-cleaned
+  Mesures réelles dans 20+ maisons britanniques sur plusieurs années.
+  Fréquence d'échantillonnage : 1 mesure toutes les 8 secondes.
+  Format : CSV par maison, colonnes = [Time, Aggregate, Appliance1, Appliance2, ...]
+
+
+Chaque fichier CSV contient :
+  - Une colonne de temps (Time).
+  - Une colonne Unix
+  - Une colonne "Aggregate" = consommation totale du foyer en Watts.
+  - Des colonnes par appareil = consommation individuelle en Watts (9 appareils chaque maison)
+    (utilisées comme vérité terrain pour l'entraînement et l'évaluation).
+
+Structure du dossier de données attendue :
+  Processed_Data_CSV/
+  ├── House_1.csv
+  ├── House_2.csv
+  └── ... (jusqu'à House_21.csv)
+
+
+================================================================================
+SECTION 2 — ARCHITECTURE DU PROJET
+================================================================================
+
+Organise le projet selon l'arborescence suivante :
+
+  Projet_NILM/
+  ├── Processed_Data_CSV/
+  │   ├── House_1.csv
+  │   ├── House_2.csv
+  │   └── ... (jusqu'à House_21.csv)              (dèjà existante dans le projet)
+  ├── Preprocessing/
+  │   └── Algorithms/
+  │       ├── preprocessing.py (hampel_filter ← Suppression des valeurs aberrantes /interpolation ← Comparaison des méthodes d'interpolation)        
+  │       └── check_preprocessing.py           
+  ├── Event_Detection/
+  │   └── Algorithms/
+  │       ├── steady_states.py           ← Détection Hart 1985 (états stables)
+  │       ├── cumsum.py                  ← Algorithme CUSUM
+  │       ├── ca_cfar.py                 ← Algorithme CA-CFAR
+  │       ├── local_threshold_based.py   ← Seuillage local adaptatif
+  │       └── binary_segmentation.py     ← Segmentation binaire (ruptures)
+  ├── Clustering/
+  │   └── Coding/
+  │       ├── Appliance.py               ← Classe Appliance (clustering en ligne)
+  │       └── cluster.py                 ← Fonctions K-Means / MeanShift
+  └── HMM_Disaggregation/
+      └── Super_State_HMM/
+          ├── Viterbi/
+          │   ├── algo_Viterbi.py        ← Viterbi classique
+          │   └── algo_SparseViterbi.py  ← Viterbi creux (optimisé)
+          └── Testing/
+              └── test_Algorithm.py      ← Script de test et d'évaluation
+
+
+================================================================================
+SECTION 3 — DESCRIPTION DÉTAILLÉE DE CHAQUE FICHIER
+================================================================================
+
+------------------------------------------------------------------------
+3.1  Preprocessing/Algorithms/hampel_filter.py
+     Rôle : Filtre de Hampel — détection et correction des outliers
+------------------------------------------------------------------------
+
+Implémente la fonction hampel_filter(series, window_size, n_sigmas=3) qui :
+1. Calcule la médiane glissante sur une fenêtre de taille 2×window_size (centrée).
+2. Calcule la MAD (Median Absolute Deviation) pondérée par k=1.4826
+   (facteur de cohérence pour une distribution gaussienne).
+3. Remplace tout point dont |valeur - médiane| > n_sigmas × MAD par la médiane locale.
+4. Retourne la série filtrée et un masque booléen des outliers détectés.
+
+Utilisation dans le script :
+- Appliqué sur la colonne "Aggregate" d'un DataFrame df.
+- Extrait un mois de données : excerpt = df['Aggregate'].iloc[:96*30]
+- Appelle hampel_filter(excerpt, window_size=15)
+- Trace la série filtrée avec les outliers en rouge.
+- Ajoute une vue zoomée en inset pour valider visuellement la correction.
+
+Dépendances : numpy, pandas, matplotlib
+
+Pourquoi ce filtre : Les capteurs électriques génèrent parfois des pics parasites
+(erreurs de transmission, transitoires courts). Le filtre de Hampel est robuste
+car il utilise la médiane (insensible aux valeurs extrêmes) plutôt que la moyenne.
+
+
+------------------------------------------------------------------------
+3.2  Preprocessing/Algorithms/interpolation.py
+     Rôle : Comparaison des méthodes d'interpolation pour données manquantes
+------------------------------------------------------------------------
+
+Ce script compare quatre méthodes d'interpolation pandas sur un signal de puissance :
+  - Linéaire
+  - Polynomiale ordre 3
+  - Polynomiale ordre 5
+  - Spline cubique ordre 3
+
+Étapes du script :
+1. Extrait un segment de 200 points depuis df_smd['Aggregate'].
+2. Simule des données manquantes aux positions 18 à 22 (remplacement par NaN).
+3. Applique chaque méthode avec df['Aggregate'].interpolate(method=..., order=...)
+4. Compare visuellement les reconstructions sur la zone manquante.
+5. Évalue la MAE (Mean Absolute Error) sur 2% de données masquées aléatoirement.
+6. Compare également au remplissage naïf par zéro.
+
+Dépendances : numpy, pandas, matplotlib, sklearn.metrics, scipy
+
+Résultat attendu : La spline cubique et le polynôme d'ordre 3 donnent généralement
+la meilleure MAE pour des lacunes courtes (< 5 points). Pour les longues lacunes,
+l'interpolation linéaire est plus stable.
+
+
+------------------------------------------------------------------------
+3.3  Event_Detection/Algorithms/steady_states.py
+     Rôle : Détection des états stables (algorithme de Hart 1985)
+------------------------------------------------------------------------
+
+Implémente deux fonctions principales :
+
+find_steady_states(dataframe, min_n_samples=2, state_threshold=15, noise_level=70) :
+  - Parcourt la série point par point en maintenant une estimation incrémentale
+    de la puissance en état stable.
+  - Détecte une transition si |mesure_courante - mesure_précédente| > state_threshold.
+  - Conserve uniquement les transitions dont la magnitude est > noise_level.
+  - Retourne deux DataFrames : steady_states (puissance moyenne par état stable)
+    et transitions (changements de puissance entre états).
+  - Supporte 1 ou 2 mesures simultanées (puissance active seule, ou active+réactive).
+
+find_steady_states_transients(metergroup, columns, noise_level, state_threshold) :
+  - Wrapper qui appelle find_steady_states sur plusieurs segments de données
+    et concatène les résultats.
+
+Contient également une fonction cluster(x, max_num_clusters=3) identique à
+celle de cluster.py (voir section 3.5).
+
+Dépendances : numpy, pandas, sys, sklearn.cluster.KMeans, sklearn.metrics
+
+
+------------------------------------------------------------------------
+3.4  Event_Detection/Algorithms/cumsum.py
+     Rôle : Détection de points de changement par CUSUM
+------------------------------------------------------------------------
+
+Implémente deux classes de détecteurs :
+
+Classe CUSUM_Detector(warmup_period=10, delta=10, threshold=20) :
+  - predict_next(observation) : traite un point à la fois.
+    * Pendant la phase d'échauffement (warmup_period points) : estime μ et σ.
+    * Après l'échauffement : maintient S_pos et S_neg (sommes cumulées normalisées).
+    * Détecte un changement si S_pos ou S_neg > threshold.
+    * Se réinitialise (_reset) après chaque détection.
+  - detect_change_points(data) : applique predict_next sur une liste entière.
+  - plot_change_points(data, change_points, pos_changes, neg_changes) : visualisation.
+
+Classe ProbCUSUM_Detector(warmup_period=10, threshold_probability=0.05) :
+  - Variante probabiliste : calcule la p-valeur via la loi normale.
+  - Détecte un changement si p-valeur < threshold_probability.
+
+Utilisation type :
+  detector = CUSUM_Detector(warmup_period=20, delta=15, threshold=30)
+  pos_changes, neg_changes, change_points = detector.detect_change_points(data)
+
+Dépendances : numpy, math, matplotlib, scipy.stats.norm
+
+
+------------------------------------------------------------------------
+3.5  Event_Detection/Algorithms/ca_cfar.py
+     Rôle : Détection adaptative CA-CFAR (Cell-Averaging CFAR)
+------------------------------------------------------------------------
+
+Implémente la fonction ca_cfar(signal, num_guard_cells, num_ref_cells, alpha) :
+  - Pour chaque point i :
+    * Ignore les num_guard_cells cellules de part et d'autre.
+    * Calcule le bruit local = moyenne des num_ref_cells cellules de référence.
+    * Seuil adaptatif = alpha × bruit_local.
+    * Marque i comme événement si signal[i] > seuil.
+  - Retourne detection_mask (tableau binaire).
+
+Application dans le script :
+  signal = df['Dishwasher'].values
+  detection_mask = ca_cfar(signal, num_guard_cells=10, num_ref_cells=20, alpha=2)
+  df['Detection'] = detection_mask
+
+Paramètres recommandés de départ : num_guard_cells=10, num_ref_cells=20, alpha=2.
+Ajuster alpha pour contrôler le taux de fausses alarmes.
+
+Dépendances : numpy, pandas, matplotlib
+
+
+------------------------------------------------------------------------
+3.6  Event_Detection/Algorithms/local_threshold_based.py
+     Rôle : Seuillage local adaptatif avec détection de pics
+------------------------------------------------------------------------
+
+Implémente detect_and_plot_dishwasher_events(power_series, window_size=1000,
+                                              a=1, b=1, plot=True) :
+1. Applique un filtre médian glissant sur 60 échantillons (p_med).
+2. Calcule les différences absolues : delta_p = |diff(p_med)|.
+3. Pour chaque fenêtre glissante de window_size points :
+   - Calcule mu_w (moyenne) et sigma_w (écart-type) de delta_p dans la fenêtre.
+4. Seuils globaux : s_p = mean(sigma_w) + mean(mu_w) ; s_a = s_p / 2.
+5. Sélectionne les fenêtres où sigma_w > s_a (fenêtres actives).
+6. Dans chaque fenêtre active, détecte les pics (scipy.signal.find_peaks)
+   dépassant threshold = a×mu_w[i] + b×sigma_w[i].
+7. Déduplique et retourne les indices absolus des événements.
+
+Dépendances : numpy, pandas, matplotlib, scipy.signal.find_peaks
+
+
+------------------------------------------------------------------------
+3.7  Event_Detection/Algorithms/binary_segmentation.py
+     Rôle : Segmentation binaire + clustering pour identifier les cycles ON/OFF
+------------------------------------------------------------------------
+
+Ce script (à exécuter dans un environnement notebook ou avec df défini) :
+1. Détecte les points de changement dans df['Dishwasher'] via la bibliothèque
+   ruptures (rpt.Binseg) avec modèle de coût "l2" :
+     algo = rpt.Binseg(model="l2").fit(dishwasher_series)
+     my_bkps = algo.predict(pen=np.log(n) * dim * sigma**2)
+2. Extrait une signature (temps de début, puissance moyenne) pour chaque segment.
+3. Applique K-Means (n_clusters=2) pour classifier les segments en états ON et OFF.
+4. Paire les événements ON et OFF pour identifier les cycles complets.
+5. Stocke les cycles dans un DataFrame avec colonnes :
+   [Appliance, ON_Time, OFF_Time, Duration, Power_Level].
+6. Génère trois visualisations :
+   - Série temporelle avec les ruptures détectées.
+   - Scatter plot des clusters ON/OFF.
+   - Série avec marqueurs des cycles pairés.
+
+Dépendances : numpy, pandas, matplotlib, ruptures, sklearn.cluster.KMeans
+
+
+------------------------------------------------------------------------
+3.8  Clustering/Coding/cluster.py
+     Rôle : Fonctions de clustering K-Means et MeanShift pour les états d'appareils
+------------------------------------------------------------------------
+
+Fonction principale cluster(X, max_num_clusters=3, exact_num_clusters=None) :
+  - X : pd.Series ou DataFrame mono-colonne de valeurs de puissance.
+  - Appelle _transform_data(X) : sous-échantillonne si nécessaire
+    (max 2000 points, seuil > 10 W pour ignorer l'état OFF).
+  - Appelle _apply_clustering(data, max_num_clusters, exact_num_clusters).
+  - Ajoute le centroïde 0 (état OFF).
+  - Retourne les centroïdes triés et arrondis en int32.
+
+Fonction _apply_clustering(X, max_num_clusters, exact_num_clusters=None) :
+  - Si exact_num_clusters spécifié : utilise directement K-Means avec ce nombre.
+  - Sinon : évalue K-Means pour k=1 à max_num_clusters-1 et sélectionne k
+    maximisant le score de silhouette (sklearn.metrics.silhouette_score).
+  - Retourne les centroïdes aplatis.
+
+Fonction hart85_means_shift_cluster(pair_buffer_df, columns) :
+  - Applique MeanShift (sklearn.cluster.MeanShift) sur les transitions pairées.
+  - Construit un vecteur de caractéristiques combinant puissance active, réactive
+    et/ou apparente selon les colonnes disponibles.
+  - Retourne un DataFrame des centroïdes de clusters.
+
+Dépendances : numpy, pandas, sklearn.cluster.KMeans, sklearn.cluster.MeanShift,
+              sklearn.metrics
+
+
+------------------------------------------------------------------------
+3.9  Clustering/Coding/Appliance.py
+     Rôle : Classe Appliance — clustering en ligne et génération des paramètres HMM
+------------------------------------------------------------------------
+
+Classe Appliance(name, series, initial_means) :
+  Attributs :
+    - name : nom de l'appareil (ex: "refrigerator").
+    - series : pd.Series de la consommation de l'appareil.
+    - numberOfClusters : nombre d'états (= len(initial_means)).
+    - means[], covs[], mins[], maxs[], numberOfPoints[] : statistiques par état.
+    - transitionMatrix[][] : matrice de transition normalisée (HMM).
+    - clusteredSeries : série avec les indices de cluster à chaque instant.
+    - stateTransitions : liste des transitions (état, durée).
+
+  Méthodes clés :
+    - findCluster(val) : retourne l'index du cluster le plus proche de val.
+    - calculateClustersMeans() : passe de scan sur series pour mettre à jour means[].
+    - classifyPoints() : construit seriesPerCluster (une pd.Series par état).
+    - updateParameters() : recalcule mins, maxs, means, covs, clusteredSeries,
+      stateTransitions, transitionMatrix.
+    - updateClusters() : enchaîne calculateClustersMeans → classifyPoints →
+      updateParameters (workflow complet).
+    - getStateTransitions() : extrait les transitions en filtrant les transitoires
+      courts (durée ≤ 3 et passage intermédiaire ascendant/descendant).
+    - calculateTransitionMatrix() : construit et normalise la matrice de transition.
+    - plotClusteredSeries() / plot() : visualisations matplotlib.
+    - __str__() : génère le code Python formaté pour initialiser le HMM :
+        pi['nom'] = np.array([...])
+        a['nom']  = np.array([[...]])
+        mean['nom'] = np.array([[μ0], [μ1], ...])
+        cov['nom']  = np.array([[[σ²0]], [[σ²1]], ...])
+
+  Initialisation type :
+    appliance = Appliance("refrigerator", df['Refrigerator'], [0, 80, 160])
+    appliance.updateClusters()
+    print(appliance)  # affiche les paramètres HMM prêts à l'emploi
+
+Dépendances : numpy, pandas, matplotlib, IPython.display.clear_output
+
+
+------------------------------------------------------------------------
+3.10 HMM_Disaggregation/Super_State_HMM/Viterbi/algo_Viterbi.py
+     Rôle : Algorithme de Viterbi classique (complexité O(K²))
+------------------------------------------------------------------------
+
+Implémente disagg_algo(hmm, y) avec y = [y0, y1] (deux observations consécutives) :
+  1. Initialise Pt[0] (dense, taille K) : Pt[0][j] = hmm.P0[j] × hmm.B[j, y0]
+  2. Pour chaque état j, calcule :
+     Pt[1][j] = max_i ( Pt[0][i] × hmm.A[i,j] ) × hmm.B[j, y1]
+  3. Retourne argmax(Pt[1]) : (probabilité_max, état_optimal, Pt[1], cdone, ctotal)
+
+Interface HMM attendue :
+  hmm.K  : nombre total de super-états
+  hmm.P0 : vecteur de probabilités initiales (taille K)
+  hmm.A  : matrice de transition (K×K)
+  hmm.B  : matrice d'émission B[j, y] = P(observer y depuis état j)
+
+Compteurs de performance :
+  cdone  = [K, K²] (tous les calculs sont effectués dans cette version dense)
+  ctotal = [K, K²]
+
+Retour : (p, k, Pt[1], cdone, ctotal) où p = probabilité, k = index état optimal.
+
+
+------------------------------------------------------------------------
+3.11 HMM_Disaggregation/Super_State_HMM/Viterbi/algo_SparseViterbi.py
+     Rôle : Algorithme de Viterbi creux (sparse) — optimisation pour grands K
+------------------------------------------------------------------------
+
+Implémente disagg_algo(hmm, y) avec y = [y0, y1], identique en interface à
+algo_Viterbi.py mais utilise des dictionnaires creux :
+
+  1. Pt[0] est un dictionnaire (pas une liste) : ne stocke que les j où
+     P0[j] ≠ 0 ET B[y0] contient j dans sa liste creuse.
+  2. Pour t=1 : itère sur (j, p_b) ∈ B[y1], puis sur (i, p_a) ∈ A[j],
+     en sautant les i absents de Pt[0].
+  3. Garde uniquement le maximum pour chaque j.
+
+Interface HMM creuse attendue :
+  hmm.B[y] : liste de tuples (j, P(y|j)) — seuls les états probables
+  hmm.A[j] : liste de tuples (i, P(j|i)) — seules les transitions non nulles
+
+Gain mesuré : cdone[0] et cdone[1] enregistrent les calculs réellement effectués
+vs ctotal=[K, K²] (économies typiques de 70-99% pour des modèles sparses).
+
+Fonctions helpers : dict_argmax(d) retourne (valeur_max, clé_correspondante).
+
+
+------------------------------------------------------------------------
+3.12 HMM_Disaggregation/Super_State_HMM/Testing/test_Algorithm.py
+     Rôle : Script principal de test et d'évaluation — point d'entrée de la pipeline
+------------------------------------------------------------------------
+
+Usage en ligne de commande :
+  python test_Algorithm.py [test_id] [modeldb] [dataset] [precision] \
+                            [measure] [denoised] [limit] [algo_name]
+
+  - test_id    : identifiant de l'expérience (ex: "exp01")
+  - modeldb    : nom du fichier modèle JSON (sans extension)
+  - dataset    : nom du fichier dataset CSV (sans extension)
+  - precision  : facteur de quantification (ex: 10 → convertit A en dA)
+  - measure    : unité de mesure (ex: "A" pour Ampères, "W" pour Watts)
+  - denoised   : "denoised" ou "noisy"
+  - limit      : nombre maximum d'observations à tester, ou "all"
+  - algo_name  : "Viterbi" ou "SparseViterbi" (charge algo_<algo_name>.py)
+
+Étapes du script :
+  1. Charge le modèle JSON (liste de SSHMMs sérialisés, un par fold).
+  2. Pour chaque fold de validation croisée :
+     a. Charge les données de test via libDataLoaders.dataset_loader().
+     b. Appelle disagg_algo(sshmm, [y0, y1]) pour chaque paire d'observations.
+     c. Récupère l'état estimé via sshmm.detangle_k(k) et la puissance
+        estimée via sshmm.y_estimate(s_est, breakdown=True).
+     d. Accumule les métriques via acc.classification_result() et
+        acc.measurement_result().
+  3. Pour le dernier fold : génère des graphiques PNG "Actual vs Predicted"
+     pour chaque appareil.
+  4. Affiche un tableau de synthèse CSV avec tous les paramètres et résultats.
+
+Librairies internes requises (non incluses — à implémenter séparément) :
+  - libDataLoaders : charge les CSV, applique la précision et le débruitage.
+  - libFolding : gère le découpage k-fold temporel des données.
+  - libSSHMM : Super-State HMM (construction, entraînement, inférence).
+  - libAccuracy : calcul de MAE, F1-score, et autres métriques NILM.
+
+Dépendances : sys, json, statistics, time, datetime, matplotlib
+
+
+================================================================================
+SECTION 4 — FLUX DE DONNÉES (PIPELINE END-TO-END)
+================================================================================
+
+Étape 1 : Chargement
+  Entrée  : fichiers CSV (House_N.csv) — colonnes [Time, Aggregate, App1, App2, ...]
+  Action  : lecture pandas, parsing de l'horodatage, tri chronologique
+
+Étape 2 : Pré-traitement
+  Entrée  : DataFrame brut
+  Action  : hampel_filter (outliers) → interpolation (NaN) → resample si besoin
+  Sortie  : DataFrame propre et complet, index DatetimeIndex
+
+Étape 3 : Détection d'événements
+  Entrée  : signal de puissance d'un appareil (ou signal agrégé)
+  Action  : choisir un ou plusieurs algorithmes parmi :
+            - Hart steady_states  (méthode de référence, event-based)
+            - CUSUM               (sensible aux dérives abruptes)
+            - CA-CFAR             (robuste au bruit non stationnaire)
+            - Seuillage local     (adaptatif, détection de pics)
+            - Segmentation binaire (ruptures + K-Means)
+  Sortie  : liste des instants de transition ON/OFF par appareil
+
+Étape 4 : Clustering
+  Entrée  : série de puissance d'un appareil
+  Action  : cluster() ou Appliance.updateClusters()
+  Sortie  : centroïdes (niveaux de puissance par état) + matrice de transition A
+            + paramètres émission μ, σ² → paramètres HMM complets (π, A, μ, Σ)
+
+Étape 5 : Construction du SSHMM
+  Entrée  : paramètres HMM par appareil (π_i, A_i, μ_i, Σ_i)
+  Action  : combiner en un seul HMM global (produit cartésien des états)
+            K_total = ∏ K_i états — matrices A et B creuses
+  Sortie  : modèle SSHMM sérialisé en JSON
+
+Étape 6 : Désagrégation (inférence en ligne)
+  Entrée  : signal agrégé (paires d'observations consécutives) + modèle SSHMM
+  Action  : algo_SparseViterbi.disagg_algo(sshmm, [y0, y1])
+  Sortie  : état estimé de chaque appareil à chaque instant t
+            + puissance estimée par appareil
+
+Étape 7 : Évaluation
+  Entrée  : séquences estimées + vérité terrain
+  Action  : test_Algorithm.py (validation croisée k-fold)
+  Sortie  : MAE par appareil, F1-score, précision de classification, rapport CSV
+
+
+================================================================================
+SECTION 5 — DÉPENDANCES ET ENVIRONNEMENT
+================================================================================
+
+Dépendances Python principales :
+  numpy >= 1.21
+  pandas >= 1.3
+  matplotlib >= 3.4
+  scikit-learn >= 0.24    (KMeans, MeanShift, silhouette_score)
+  scipy >= 1.7            (norm, find_peaks, interpolate)
+  ruptures >= 1.1         (Binseg pour la segmentation binaire)
+  pyarrow (optionnel)     (si sauvegarde parquet pour le preprocessing)
+
+Installation :
+  pip install numpy pandas matplotlib scikit-learn scipy ruptures pyarrow
+
+Environnement recommandé :
+  Python 3.8+, Jupyter Notebook (pour les scripts de visualisation interactive)
+
+
+================================================================================
+SECTION 6 — CONVENTIONS DE CODE
+================================================================================
+
+- Langage : Python 3.
+- Les scripts de preprocessing et de détection d'événements sont conçus pour
+  fonctionner avec un DataFrame df déjà chargé (pattern notebook/REPL).
+- Les classes (Appliance, CUSUM_Detector) suivent le pattern orienté objet
+  classique avec méthodes publiques et privées (préfixe _ pour les internes).
+- Les fonctions de désagrégation (disagg_algo) ont une interface uniforme :
+  (hmm, y) → (p, k, Pt, cdone, ctotal) pour être interchangeables.
+- Les paramètres HMM sont nommés de façon cohérente :
+    pi['nom_appareil'] = probabilité initiale
+    a['nom_appareil']  = matrice de transition
+    mean['nom_appareil'] = vecteur des moyennes des états
+    cov['nom_appareil']  = matrice de covariance des états
+- Les graphiques utilisent matplotlib avec figsize=(10,5) ou (12,5) par défaut.
+- Les print() de progression sont présents dans les méthodes longues
+  (calculateClustersMeans, find_steady_states) pour informer l'utilisateur.
+
+
+================================================================================
+SECTION 7 — POINTS D'ATTENTION POUR LA REPRODUCTION
+================================================================================
+
+1. Le Super-State HMM (libSSHMM) n'est pas inclus dans ce repository ; il s'agit
+   d'une librairie externe de Stephen Makonin (2013-2015). Implémente-la ou
+   recherche une version open-source compatible.
+
+2. La matrice d'émission B dans algo_SparseViterbi.py attend un format creux :
+   B[y] = liste de (j, P(y|j)). Assure-toi que libSSHMM génère ce format.
+
+3. Le signal REFIT est échantillonné toutes les 8 secondes. Si ton dataset a une
+   fréquence différente, adapte le paramètre resample_rule dans le preprocessing.
+
+4. La classe Appliance.py utilise iteritems() (API pandas < 2.0). Pour pandas ≥ 2.0,
+   remplace iteritems() par items().
+
+5. Le filtre Hampel utilise rolling().apply() avec une fonction MAD personnalisée,
+   ce qui peut être lent sur de grandes séries. Pour de meilleures performances,
+   envisage une implémentation vectorisée avec numpy.
+
+6. Le nombre d'états par appareil (initial_means dans Appliance) doit être choisi
+   a priori selon la connaissance de l'appareil :
+   - Réfrigérateur : 2 états (OFF, compresseur ON)
+   - Lave-vaisselle : 3-5 états (OFF, préchauffage, lavage, rinçage, séchage)
+   - Machine à laver : 4-6 états
+
+7. Pour les datasets REFIT avec 21 maisons, un split temporel recommandé est :
+   70% entraînement / 15% validation / 15% test (sur chaque maison séparément).
+
+================================================================================
+FIN DU PROMPT DE REPRODUCTION
+================================================================================
